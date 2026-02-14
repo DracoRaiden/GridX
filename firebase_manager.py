@@ -18,9 +18,10 @@ with open(SERVICE_ACCOUNT_PATH, "r", encoding="utf-8") as key_file:
     if not project_id:
         raise RuntimeError(f"serviceAccountKey.json at {SERVICE_ACCOUNT_PATH} missing project_id")
 
-firebase_admin.initialize_app(cred, {
-    "databaseURL": f"https://{project_id}-default-rtdb.firebaseio.com/"
-})
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": f"https://{project_id}-default-rtdb.firebaseio.com/"
+    })
 
 # --- CONTROLLERS ---
 

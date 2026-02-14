@@ -39,6 +39,14 @@ st.markdown("""
 # We use a placeholder container to refresh ONLY the data, not the whole page.
 dashboard = st.empty()
 
+
+def _append_log(entry: str, max_items: int = 50) -> None:
+    if "agent_log_history" not in st.session_state:
+        st.session_state.agent_log_history = []
+    st.session_state.agent_log_history.append(entry)
+    if len(st.session_state.agent_log_history) > max_items:
+        st.session_state.agent_log_history = st.session_state.agent_log_history[-max_items:]
+
 def render_dashboard():
     # 1. FETCH REAL-TIME DATA
     try:
@@ -74,6 +82,23 @@ def render_dashboard():
         delta_color="off" if grid_status == "OFF" else "normal"
     )
 
+    # Track live log changes for display
+    house_a_log = house_a.get("agent_log", "Sleeping...")
+    house_b_log = house_b.get("agent_log", "Sleeping...")
+    last_trade = market.get("latest_transaction")
+    last_seen = st.session_state.get("_last_logs", {})
+    if house_a_log and house_a_log != last_seen.get("house_a"):
+        _append_log(f"[{time.strftime('%H:%M:%S')}] House A: {house_a_log}")
+    if house_b_log and house_b_log != last_seen.get("house_b"):
+        _append_log(f"[{time.strftime('%H:%M:%S')}] House B: {house_b_log}")
+    if last_trade and last_trade != last_seen.get("trade"):
+        _append_log(f"[{time.strftime('%H:%M:%S')}] Market: {last_trade}")
+    st.session_state._last_logs = {
+        "house_a": house_a_log,
+        "house_b": house_b_log,
+        "trade": last_trade,
+    }
+
     with dashboard.container():
         # --- ROW 1: MARKET STATUS ---
         kpi1, kpi2, kpi3, kpi4 = st.columns(4)
@@ -103,11 +128,11 @@ def render_dashboard():
             with st.container(height=300):
                 # House A Log
                 st.markdown(f"**🏠 House A (Seller):**")
-                st.info(f"_{house_a.get('agent_log', 'Sleeping...')}_")
+                st.info(f"_{house_a_log}_")
                 
                 # House B Log
                 st.markdown(f"**🏢 House B (Buyer):**")
-                st.warning(f"_{house_b.get('agent_log', 'Sleeping...')}_")
+                st.warning(f"_{house_b_log}_")
 
                 # Market Contract
                 if market.get('active_contract'):
@@ -136,5 +161,27 @@ def render_dashboard():
                 # Optional: Write to firebase to trigger Red LEDs
                 # db.reference('/visuals').update({"led_mode": "THEFT_ALERT"})
 
+        st.divider()
+
+        st.subheader("📡 Agent Communication Log")
+        with st.container(height=250):
+            for entry in st.session_state.get("agent_log_history", ["No activity yet."]):
+                st.markdown(entry)
+
+
+def _auto_refresh(interval_ms: int) -> None:
+    try:
+        from streamlit_autorefresh import st_autorefresh
+
+        st_autorefresh(interval=interval_ms, key="live_refresh")
+    except Exception:
+        # Fallback: only use rerun if available; otherwise do nothing.
+        if hasattr(st, "rerun"):
+            time.sleep(interval_ms / 1000)
+            st.rerun()
+
 # --- RENDER DASHBOARD ---
+enable_live = st.toggle("Enable Live Feed", value=True)
+if enable_live:
+    _auto_refresh(interval_ms=2000)
 render_dashboard()
