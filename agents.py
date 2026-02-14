@@ -3,6 +3,24 @@ import os
 from google import genai
 from firebase_manager import db, get_full_state, reset_simulation
 
+
+def _load_env_file(path: str = ".env") -> None:
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as env_file:
+        for line in env_file:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("\"")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+_load_env_file()
+
 # --- CONFIGURATION ---
 # Load API key from environment variable
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -12,7 +30,8 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 LIST_MODELS = os.getenv("GEMINI_LIST_MODELS")
 USE_MOCK = os.getenv("USE_MOCK_AGENTS", "false").lower() == "true"
-LOOP_DELAY = int(os.getenv("LOOP_DELAY", "15"))  # Seconds between iterations
+_loop_delay_raw = os.getenv("LOOP_DELAY", "15").strip()
+LOOP_DELAY = int(_loop_delay_raw) if _loop_delay_raw else 15  # Seconds between iterations
 
 class EnergyAgent:
     def __init__(self, name, role):
