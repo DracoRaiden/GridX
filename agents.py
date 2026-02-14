@@ -48,30 +48,45 @@ class EnergyAgent:
     def generate_prompt(self, world_state):
         grid = world_state['grid']
         grid_price = grid.get("price", grid.get("price_per_unit", 0))
+        grid_status = grid.get("status", "ONLINE")
         me = world_state[self.name]
         sim_time = world_state['simulation'].get('clock', '12:00')
-        
-        # Calculate Net Energy (Solar - Load)
-        net_energy = me.get('solar_output', 0) - me.get('current_load', 0)
+
+          # Calculate Net Energy (Solar - Load)
+        solar = me.get('solar_output', me.get('solar_input', 0))
+        load = me.get('current_load', 0)
+        net_energy = solar - load
         battery = me.get('battery_level', 50)
+        is_night = solar < 0.1
         
         system_instruction = f"""
-        You are the AI Energy Manager for {self.name} ({self.role}) in Pakistan.
+          You are the Smart Energy Agent for {self.name} ({self.role}) in Pakistan.
         Current Time: {sim_time}
         
-        STATUS:
-        - Grid Status: {grid['status']} (Price: Rs {grid_price})
-        - My Battery: {battery}%
-        - Net Generation: {net_energy:.2f} kW (Positive=Excess, Negative=Deficit)
-        
-        CRITICAL RULES:
-        1. LOAD SHEDDING (Grid OFF): You CANNOT sell to Grid.
-        2. MASJID CHARITY: If Grid is OFF, Battery > 90%, and you have Excess Energy -> DONATE to "Masjid".
-        3. P2P TRADING: If Grid is ON but Expensive (>40), sell to neighbor cheaper.
-        
-        DECISION:
-        Return strict format: "ACTION | REASONING"
-        Allowed Actions: "HOLD", "CHARGE_FROM_GRID", "SELL_TO_GRID", "OFFER_P2P", "BUY_P2P", "DONATE_MASJID"
+          DATA:
+          - Grid Status: {grid_status} (Price: Rs {grid_price})
+          - Solar Output: {solar:.2f} kW
+          - House Load: {load:.2f} kW
+          - Battery: {battery}%
+          - Net Generation: {net_energy:.2f} kW (Positive=Excess, Negative=Deficit)
+          - Night Mode: {is_night}
+
+          STRICT RULES:
+          1. NIGHT MODE (Solar ~ 0): DO NOT sell. You are consuming.
+              - If Battery < 40% and Price is Cheap -> ACTION: "CHARGE_FROM_GRID"
+              - If Battery is fine -> ACTION: "HOLD"
+
+          2. DAY MODE (Solar > Load): You have excess power.
+              - If Grid is Expensive (>40) -> ACTION: "OFFER_P2P" (Sell to neighbor).
+              - If Grid is Cheap (<30) -> ACTION: "CHARGE_BATTERY" (Store it).
+
+          3. LOAD SHEDDING (Grid OFF):
+              - If Battery > 90% -> ACTION: "DONATE_MASJID"
+              - Else -> ACTION: "HOLD" (Conserve power).
+
+          DECISION FORMAT:
+          Return exactly: "ACTION | REASONING"
+          Allowed Actions: "HOLD", "CHARGE_FROM_GRID", "CHARGE_BATTERY", "SELL_TO_GRID", "OFFER_P2P", "BUY_P2P", "DONATE_MASJID"
         """
         return system_instruction
 
@@ -97,14 +112,26 @@ class EnergyAgent:
                 else:
                     action = "HOLD"
                     reasoning = raw_output
-            
+
+            action = action.strip()
+            reasoning = reasoning.strip()
+
             # Update Log
-            print(f"🤖 {self.name}: {action}")
+            if action == "OFFER_P2P":
+                print(f"🟢 {self.name}: SELLING  | {reasoning[:50]}...")
+            elif action == "CHARGE_FROM_GRID":
+                print(f"🔌 {self.name}: CHARGING | {reasoning[:50]}...")
+            elif action == "DONATE_MASJID":
+                print(f"🕌 {self.name}: CHARITY  | {reasoning[:50]}...")
+            elif action == "CHARGE_BATTERY":
+                print(f"🔋 {self.name}: STORING  | {reasoning[:50]}...")
+            else:
+                print(f"⚪ {self.name}: {action}     | {reasoning[:50]}...")
             db.reference(f'/{self.name}').update({
-                "agent_log": reasoning.strip(),
-                "last_action": action.strip()
+                "agent_log": reasoning,
+                "last_action": action
             })
-            return action.strip()
+            return action
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:

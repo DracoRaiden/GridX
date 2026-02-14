@@ -6,11 +6,11 @@ import os
 SIM_MODE = os.getenv("SIMULATION_MODE", "test").lower()
 
 if SIM_MODE == "full":
-    # Time range: 24 hours in 15-second intervals
-    times = pd.date_range("2026-02-14 00:00:00", "2026-02-14 23:59:45", freq="15s")
+    # Time range: 24 hours in 5-minute intervals
+    times = pd.date_range("2026-02-14 00:00:00", "2026-02-14 23:55:00", freq="5min")
 else:
-    # Time range: 2 hours in 15-second intervals (480 steps for quick testing)
-    times = pd.date_range("2026-02-14 00:00:00", "2026-02-14 02:00:00", freq="15s")
+    # Time range: 2 hours in 5-minute intervals (24 steps for quick testing)
+    times = pd.date_range("2026-02-14 00:00:00", "2026-02-14 02:00:00", freq="5min")
 
 data = []
 
