@@ -1,8 +1,16 @@
 import pandas as pd
 import numpy as np
+import os
 
-# Time range: 24 hours in 30-min intervals
-times = pd.date_range("2026-02-14 00:00", "2026-02-14 23:30", freq="30min")
+# Get simulation mode from env (full or test)
+SIM_MODE = os.getenv("SIMULATION_MODE", "test").lower()
+
+if SIM_MODE == "full":
+    # Time range: 24 hours in 15-second intervals
+    times = pd.date_range("2026-02-14 00:00:00", "2026-02-14 23:59:45", freq="15s")
+else:
+    # Time range: 2 hours in 15-second intervals (480 steps for quick testing)
+    times = pd.date_range("2026-02-14 00:00:00", "2026-02-14 02:00:00", freq="15s")
 
 data = []
 
@@ -31,7 +39,7 @@ for t in times:
     load_b = 1.0 + (1.5 if 18 <= hour <= 22 else 0) # AC turns on at night
 
     data.append({
-        "timestamp": t.strftime("%H:%M"),
+        "timestamp": t.strftime("%H:%M:%S"),
         "grid_status": "OFF" if is_load_shedding else "ON",
         "grid_price": grid_price,
         "house_a_solar": round(solar_a, 2),
@@ -42,5 +50,6 @@ for t in times:
 
 df = pd.DataFrame(data)
 df.to_csv("simulation_data.csv", index=False)
-print("✅ Dataset generated: simulation_data.csv")
-print(df.head())
+print(f"✅ Dataset generated: simulation_data.csv ({SIM_MODE} mode, {len(df)} steps)")
+print(f"⏱️  Duration: {len(df) * 0.25 / 60:.1f} minutes")
+print(df.head(10))

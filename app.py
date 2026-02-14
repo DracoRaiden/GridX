@@ -161,12 +161,6 @@ def render_dashboard():
                 # Optional: Write to firebase to trigger Red LEDs
                 # db.reference('/visuals').update({"led_mode": "THEFT_ALERT"})
 
-        st.divider()
-
-        st.subheader("📡 Agent Communication Log")
-        with st.container(height=250):
-            for entry in st.session_state.get("agent_log_history", ["No activity yet."]):
-                st.markdown(entry)
 
 
 def _auto_refresh(interval_ms: int) -> None:
@@ -180,8 +174,30 @@ def _auto_refresh(interval_ms: int) -> None:
             time.sleep(interval_ms / 1000)
             st.rerun()
 
+# --- LOGS FRAGMENT (auto-refresh only this section when supported) ---
+def _render_logs_section() -> None:
+    st.subheader("📡 Agent Communication Log")
+    with st.container(height=250):
+        for entry in st.session_state.get("agent_log_history", ["No activity yet."]):
+            st.markdown(entry)
+
+
+def _render_logs_live(enable_live: bool) -> None:
+    if enable_live:
+        _auto_refresh(interval_ms=2000)
+    _render_logs_section()
+
+
 # --- RENDER DASHBOARD ---
 enable_live = st.toggle("Enable Live Feed", value=True)
-if enable_live:
-    _auto_refresh(interval_ms=2000)
 render_dashboard()
+
+# Try to refresh only the logs section if fragments are available
+if hasattr(st, "fragment"):
+    @st.fragment
+    def _logs_fragment():
+        _render_logs_live(enable_live)
+
+    _logs_fragment()
+else:
+    _render_logs_live(enable_live)
