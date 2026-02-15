@@ -63,13 +63,35 @@ def _log_to_firebase(message: str, log_type: str = "info", agent: str = "system"
         print(message)  # Fallback: just print if Firebase fails
 
 
-def _write_action_to_firebase(action_code: int, action_label: str, reason: str) -> None:
-    """Write the single action code (1-4) to Firebase for ESP consumption."""
+def _write_actions_to_firebase(active_actions: list) -> None:
+    """Write multiple active action codes to Firebase for ESP consumption.
+    active_actions: list of dicts with keys: code, label, reason
+    """
     try:
+        actions_dict = {}
+        action_codes = []
+        labels = []
+        reasons = []
+        
+        for action in active_actions:
+            actions_dict[f"action_{action['code']}"] = True
+            action_codes.append(action['code'])
+            labels.append(action['label'])
+            reasons.append(action['reason'])
+        
+        # Set all actions to false first, then enable active ones
         db.reference("/controls").update({
-            "action": int(action_code),
-            "action_label": action_label,
-            "reason": reason,
+            "action_1": False,  # A_TO_B
+            "action_2": False,  # A_TO_MASJID
+            "action_3": False,  # GRID_TO_A
+            "action_4": False,  # GRID_TO_B
+        })
+        
+        db.reference("/controls").update({
+            **actions_dict,
+            "active_codes": action_codes,
+            "labels": ", ".join(labels),
+            "reasons": " | ".join(reasons),
             "timestamp": time.strftime("%H:%M:%S"),
         })
     except Exception as e:
@@ -155,18 +177,26 @@ class EnergyAgent:
           - Net Generation: {net_energy:.2f} kW (Positive=Excess, Negative=Deficit)
           - Night Mode: {is_night}
 
+          *** CRITICAL CONSTRAINT ***
+          NEVER EVER sell (OFFER_P2P or SELL_TO_GRID) when Solar Output < 0.1 kW.
+          At night, you have NO SOLAR to sell. Period.
+          
           STRICT RULES:
-          1. NIGHT MODE (Solar ~ 0): DO NOT sell. You are consuming.
+          1. NIGHT MODE (Solar < 0.1): MUST NOT sell. You are consuming.
+              - Only actions: "CHARGE_FROM_GRID", "HOLD", "BUY_P2P"
               - If Battery < 40% and Price is Cheap -> ACTION: "CHARGE_FROM_GRID"
               - If Battery is fine -> ACTION: "HOLD"
+              - NEVER OFFER_P2P or SELL_TO_GRID at night.
 
-          2. DAY MODE (Solar > Load): You have excess power.
-              - If Grid is Expensive (>40) -> ACTION: "OFFER_P2P" (Sell to neighbor).
-              - If Grid is Cheap (<30) -> ACTION: "CHARGE_BATTERY" (Store it).
+          2. DAY MODE (Solar > 0.5): You have solar generation.
+              - If Net Generation > 1.0 AND Grid is Expensive (>40) -> ACTION: "OFFER_P2P" (Only action for selling)
+              - If Net Generation > 1.0 AND Grid is Cheap (<30) -> ACTION: "CHARGE_BATTERY" (Store it).
+              - If Battery Low -> ACTION: "CHARGE_FROM_GRID"
+              - Else -> ACTION: "HOLD"
 
-          3. LOAD SHEDDING (Grid OFF):
-              - If Battery > 90% -> ACTION: "DONATE_MASJID"
-              - Else -> ACTION: "HOLD" (Conserve power).
+          3. BUYER MODE (If needed): Only "BUY_P2P" when Battery < 30% and need power.
+
+          4. CHARITY WINDOW (15:00-16:00 with Solar): Only "DONATE_MASJID".
 
           DECISION FORMAT:
           Return exactly: "ACTION | REASONING"
@@ -453,15 +483,17 @@ def _process_negotiation(state, act_a, act_b):
     net_a = power_flow["net_a"]
     net_b = power_flow["net_b"]
 
-    action_code = 0
-    action_label = "IDLE"
-    action_reason = "No profitable or required transfer."
+    active_actions = []  # Track all simultaneous actions
+    p2p_trade_happened = False  # Track if P2P trade occurred
 
     # --- AUTOMATIC POWER FLOW (ESP32-like logic) ---
     # P2P TRADE: If both agents want to trade AND it's profitable
     # Allow trade if: A wants to sell OR A has higher battery, AND B wants to buy
+    # VALIDATION: A can only sell if it has solar available (daytime) or sufficient battery
+    solar_a = state["house_a"].get("solar_output", 0)
+    solar_available = solar_a > 0.1  # Only sell during day when solar is available
     p2p_possible = (act_a == "OFFER_P2P" or act_a == "SELL_TO_GRID") and act_b == "BUY_P2P"
-    p2p_possible = p2p_possible and (battery_a > 30)  # A must have some battery reserve
+    p2p_possible = p2p_possible and (battery_a > 30) and solar_available  # A must have solar or high battery
     
     if p2p_possible and net_b < 0:
         # House A can sell from battery even if solar deficit
@@ -471,19 +503,13 @@ def _process_negotiation(state, act_a, act_b):
         
         trade_amount = min(-net_b, available_from_battery_a, P2P_TRADE_KWH)
         
-        if trade_amount < 0.1:
-            _write_action_to_firebase(action_code, action_label, "Insufficient battery for P2P.")
-            # Fall through to grid purchase
-        else:
+        if trade_amount >= 0.1:
             # Negotiate a deal
             agent_a = EnergyAgent("house_a", "PRODUCER")
             agent_b = EnergyAgent("house_b", "CONSUMER")
             deal = _negotiate_p2p_deal(state, agent_a, agent_b, trade_amount)
             
-            if deal is None:
-                _write_action_to_firebase(action_code, action_label, "Negotiation failed.")
-                # Fall through to grid purchase
-            else:
+            if deal is not None:
                 # Extract deal terms
                 agreed_price = deal["agreed_price"]
                 seller_bid = deal["seller_bid"]
@@ -547,45 +573,66 @@ def _process_negotiation(state, act_a, act_b):
                 state["house_a"]["wallet_balance"] = house_a_wallet
                 state["house_b"]["wallet_balance"] = house_b_wallet
 
-                action_code = 1
-                action_label = "A_TO_B"
-                action_reason = "P2P trade agreed and executed."
-                _write_action_to_firebase(action_code, action_label, action_reason)
+                active_actions.append({
+                    "code": 1,
+                    "label": "A_TO_B",
+                    "reason": "P2P trade agreed and executed."
+                })
+                
+                p2p_trade_happened = True  # Mark that P2P occurred
         
                 time.sleep(1)
                 db.reference("/market").update({"active_contract": False})
                 db.reference("/visuals").update({"led_mode": "IDLE"})
-                return
-    # --- MASJID DONATION (if excess energy and grid off) ---
-    if act_a == "DONATE_MASJID" and grid_status == "BLACKOUT" and net_a > 0.5:
-        _log_to_firebase(f"🕌 SubhanAllah! Energy {net_a:.2f} kWh donated to Masjid.", "charity", "house_a")
+                
+                # Update net_b to reflect remaining deficit after P2P trade
+                net_b = net_b + trade_amount  # Reduce B's deficit by trade amount
+                # Don't return - continue to check if grid power is still needed
+    
+    # --- MASJID DONATION (3 PM - 4 PM with solar available) ---
+    sim_time = state.get("simulation", {}).get("clock", "00:00")
+    try:
+        hour, minute = map(int, sim_time.split(":"))
+        is_donation_window = (hour == 15)  # 3 PM (15:00 in 24-hour format)
+    except:
+        is_donation_window = False
+    
+    solar_available = state["house_a"].get("solar_output", 0) > 0.1
+    
+    if is_donation_window and solar_available and net_a > 0.5:
+        donation_amount = min(net_a, state["house_a"].get("solar_output", 0))
+        _log_to_firebase(f"🕌 SubhanAllah! Energy {donation_amount:.2f} kWh donated to Masjid.", "charity", "house_a")
         current_donated = state.get("community", {}).get("total_donated_kwh", 0)
-        db.reference("/community").update({"total_donated_kwh": current_donated + net_a})
-        db.reference("/visuals").update({"led_mode": "MASJID_FLOW"})
-        action_code = 2
-        action_label = "A_TO_MASJID"
-        action_reason = "Charity flow enabled during blackout and excess available."
-        _write_action_to_firebase(action_code, action_label, action_reason)
-        return
+        db.reference("/community").update({"total_donated_kwh": current_donated + donation_amount})
+        db.reference("/visuals").update({"led_mode": "A_TO_MASJID"})
+        active_actions.append({
+            "code": 2,
+            "label": "A_TO_MASJID",
+            "reason": "Charity flow enabled during 3 PM window with solar available."
+        })
 
-    # --- GRID INTERACTION (if no P2P match) ---
+    # --- GRID INTERACTION (check for both houses) ---
     if grid_status == "ONLINE":
-        if net_a < 0:  # House A needs power
+        # House A: Only buy from grid if P2P didn't happen (avoid double-spending)
+        if net_a < 0 and not p2p_trade_happened:  # House A needs power
             cost = grid_price * (-net_a)
             _log_to_firebase(f"🔌 House A charging from grid: {-net_a:.2f} kW @ Rs {grid_price}/unit = Rs {cost:.1f}", "grid_buy", "house_a")
             db.reference("/house_a/wallet_balance").set(
                 state["house_a"].get("wallet_balance", 0) - cost
             )
-            db.reference("/visuals").update({"led_mode": "GRID_TO_A"})
-            action_code = 3
-            action_label = "GRID_TO_A"
-            action_reason = "House A deficit covered by grid."
-        elif net_a > 0 and act_a == "SELL_TO_GRID":  # House A has excess
+            active_actions.append({
+                "code": 3,
+                "label": "GRID_TO_A",
+                "reason": "House A deficit covered by grid."
+            })
+        if net_a > 0 and act_a == "SELL_TO_GRID" and solar_a > 0.1:  # House A has excess AND solar available
             revenue = grid_price * net_a
             _log_to_firebase(f"🔋 House A selling to grid: {net_a:.2f} kW @ Rs {grid_price}/unit = Rs {revenue:.1f}", "grid_sell", "house_a")
             db.reference("/house_a/wallet_balance").set(
                 state["house_a"].get("wallet_balance", 0) + revenue
             )
+        elif net_a > 0 and act_a == "SELL_TO_GRID" and solar_a < 0.1:
+            _log_to_firebase(f"⚠️ House A attempted to sell at night (no solar). Action rejected.", "warning", "house_a")
         
         if net_b < 0:  # House B needs power
             cost = grid_price * (-net_b)
@@ -593,20 +640,33 @@ def _process_negotiation(state, act_a, act_b):
             db.reference("/house_b/wallet_balance").set(
                 state["house_b"].get("wallet_balance", 0) - cost
             )
-            db.reference("/visuals").update({"led_mode": "GRID_TO_B"})
-            if action_code == 0:
-                action_code = 4
-                action_label = "GRID_TO_B"
-                action_reason = "House B deficit covered by grid."
+            active_actions.append({
+                "code": 4,
+                "label": "GRID_TO_B",
+                "reason": "House B deficit covered by grid."
+            })
     else:
         db.reference("/visuals").update({"led_mode": "BLACKOUT"})
 
-    _write_action_to_firebase(action_code, action_label, action_reason)
+    # Update LED mode based on actions
+    if len(active_actions) > 0:
+        if any(a['code'] == 3 for a in active_actions) and any(a['code'] == 4 for a in active_actions):
+            db.reference("/visuals").update({"led_mode": "GRID_TO_BOTH"})
+        elif any(a['code'] == 3 for a in active_actions):
+            db.reference("/visuals").update({"led_mode": "GRID_TO_A"})
+        elif any(a['code'] == 4 for a in active_actions):
+            db.reference("/visuals").update({"led_mode": "GRID_TO_B"})
+
+    # Write all active actions to Firebase
+    if len(active_actions) == 0:
+        active_actions.append({"code": 0, "label": "IDLE", "reason": "No action required."})
+    
+    _write_actions_to_firebase(active_actions)
 
 
 def run_marketplace_loop():
-    _log_to_firebase("🚀 ECHO-GRID: Agentic Layer Initialized...", "startup", "system")
-    _log_to_firebase(f"📊 Loop delay: {LOOP_DELAY}s | Mock mode: {USE_MOCK}", "startup", "system")
+    _log_to_firebase("🚀 ECHO-GRID: Intelligent Agents Started...", "startup", "system")
+    
     while True:
         try:
             state = get_full_state()
@@ -615,17 +675,44 @@ def run_marketplace_loop():
                 reset_simulation()
                 time.sleep(1)
                 continue
-
-            _apply_battery_dynamics(state)
-
+            
+            # Run Agents
             agent_a = EnergyAgent("house_a", "PRODUCER")
             act_a = agent_a.reason_and_act(state)
-
+            
             agent_b = EnergyAgent("house_b", "CONSUMER")
             act_b = agent_b.reason_and_act(state)
+            
+            # --- THE HARDWARE BRIDGE (Translation Layer) ---
+            hardware_action = 0  # Default OFF
+            
+            # Logic 1: P2P Trade (Action 1 -> Pin 14)
+            if act_a == "OFFER_P2P" and act_b == "BUY_P2P":
+                _log_to_firebase("💸 TRADE SUCCESS: House A -> House B", "transaction", "market")
+                hardware_action = 1 
+                db.reference('/visuals').update({"led_mode": "A_TO_B"})
 
-            _process_negotiation(state, act_a, act_b)
+            # Logic 2: Masjid Donation (Action 2 -> Pin 25)
+            elif act_a == "DONATE_MASJID":
+                _log_to_firebase("🕌 CHARITY: Donating to Masjid", "charity", "house_a")
+                hardware_action = 2
+                db.reference('/visuals').update({"led_mode": "MASJID"})
 
+            # Logic 3: Charging from Grid (Action 3 -> Pin 26)
+            elif act_a == "CHARGE_FROM_GRID":
+                _log_to_firebase("🔌 CHARGING: House A filling battery", "grid_buy", "house_a")
+                hardware_action = 3
+                db.reference('/visuals').update({"led_mode": "GRID_CHARGE"})
+
+            # Logic 4: Idle/Hold (Action 0 -> OFF)
+            else:
+                hardware_action = 0
+                db.reference('/visuals').update({"led_mode": "IDLE"})
+
+            # --- WRITE TO ESP32 PATH ---
+            # This is the line your ESP32 is waiting for!
+            db.reference('/controls').update({"action": hardware_action})
+            
             time.sleep(LOOP_DELAY)
 
         except KeyboardInterrupt:
