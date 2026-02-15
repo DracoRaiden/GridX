@@ -63,43 +63,71 @@ def _log_to_firebase(message: str, log_type: str = "info", agent: str = "system"
         print(message)  # Fallback: just print if Firebase fails
 
 
+def _write_action_to_firebase(action_code: int, action_label: str, reason: str) -> None:
+    """Write the single action code (1-4) to Firebase for ESP consumption."""
+    try:
+        db.reference("/controls").update({
+            "action": int(action_code),
+            "action_label": action_label,
+            "reason": reason,
+            "timestamp": time.strftime("%H:%M:%S"),
+        })
+    except Exception as e:
+        _log_to_firebase(f"❌ Failed to update controls: {e}", "error", "system")
+
+
 class EnergyAgent:
     def __init__(self, name, role):
         self.name = name
         self.role = role
 
     def calculate_optimal_price(self, world_state):
-        """AI-driven price calculation for P2P selling."""
+        """AI-driven price calculation for P2P selling/buying with mutual profit."""
         grid = world_state['grid']
         grid_price = grid.get("price_per_unit", WAPDA_OFFPEAK_PRICE)
         grid_status = grid.get("status", "ONLINE")
         is_peak = grid_price >= 46.0
         
-        # WAPDA reference price (what grid charges buyer)
-        wapda_ref = WAPDA_PEAK_PRICE if is_peak else WAPDA_OFFPEAK_PRICE
+        # WAPDA reference price (what grid charges)
+        wapda_ref = grid_price  # Use actual grid price instead of hardcoded peak/offpeak
         
         if self.role == "PRODUCER":
-            # Seller wants to maximize profit while staying cheaper than WAPDA
-            # Profit margin = seller_price - WAPDA_GENERATION_COST
-            # Buyer total cost = seller_price + TRANSMISSION_RENT_PER_UNIT
+            # Seller wants profit while keeping buyer profitable
+            # Buyer pays: seller_price + transmission_rent
+            # For buyer to profit (save money vs WAPDA):
+            #   seller_price + transmission_rent < WAPDA_ref - minimum_savings
             
-            # Upper bound: Buyer should pay less than WAPDA
-            buyer_ceiling = wapda_ref - 5.0  # Give buyer at least 5 rupee discount
+            minimum_buyer_savings = 1.0  # At least 1 rupee profit for buyer (reduced)
+            max_seller_price = wapda_ref - TRANSMISSION_RENT_PER_UNIT - minimum_buyer_savings
             
-            # Seller wants to make > 11 rupees (generation cost)
-            # Ideally: sell_price >= WAPDA_GENERATION_COST + margin
-            margin_target = 5.0  # Seller wants 5 rupee profit
-            sell_price = max(WAPDA_GENERATION_COST + margin_target, buyer_ceiling - TRANSMISSION_RENT_PER_UNIT)
+            # Seller wants profit > generation cost
+            min_seller_price = WAPDA_GENERATION_COST + 1.0  # At least 1 rupee profit (reduced)
             
-            return round(min(sell_price, buyer_ceiling - TRANSMISSION_RENT_PER_UNIT), 1)
+            # Seller's bid: take the average of min and max, leaning toward lower to close deals
+            seller_bid = round((min_seller_price * 2 + max_seller_price) / 3.0, 1)
+            seller_bid = min(seller_bid, max_seller_price)
+            seller_bid = max(seller_bid, min_seller_price)
+            
+            return seller_bid
         
         else:
-            # Buyer wants to minimize cost
-            # If grid is OFF, willing to pay more
-            if grid_status == "BLACKOUT":
-                return round(WAPDA_PEAK_PRICE * 0.9, 1)  # 90% of peak price
-            else:
-                return round(min(WAPDA_OFFPEAK_PRICE * 0.8, 30.0), 1)  # Max 30 rupees
+            # Buyer wants to maximize savings while offering fair price
+            # Buyer's total cost: seller_price + transmission_rent
+            # Buyer saves if: seller_price + transmission_rent < WAPDA_ref
+            
+            # Buyer is willing to pay up to WAPDA - 0.5 rupee savings minimum
+            max_buyer_bid = wapda_ref - TRANSMISSION_RENT_PER_UNIT - 0.5
+            
+            # Buyer wants to pay minimum, but not less than generation cost
+            # (to be fair to seller, at least seller breaks even)
+            min_buyer_bid = WAPDA_GENERATION_COST + 0.5
+            
+            # Buyer's bid: average, leaning toward max to ensure deal happens
+            buyer_bid = round((min_buyer_bid + max_buyer_bid * 2) / 3.0, 1)
+            buyer_bid = min(buyer_bid, max_buyer_bid)
+            buyer_bid = max(buyer_bid, min_buyer_bid)
+            
+            return buyer_bid
 
     def generate_prompt(self, world_state):
         grid = world_state['grid']
@@ -363,6 +391,58 @@ def _calculate_power_flow(state):
     }
 
 
+def _negotiate_p2p_deal(state, agent_a, agent_b, trade_amount):
+    """Intelligent negotiation between seller and buyer for mutual profit."""
+    grid_price = state["grid"].get("price_per_unit", WAPDA_OFFPEAK_PRICE)
+    wapda_ref = grid_price  # Use actual grid price
+    
+    # Get each party's bid
+    seller_bid = agent_a.calculate_optimal_price(state)
+    buyer_bid = agent_b.calculate_optimal_price(state)
+    
+    # Check if deal is possible (buyer willing to pay at least seller's minimum)
+    if buyer_bid < seller_bid:
+        _log_to_firebase(f"❌ NO P2P DEAL: Seller wants Rs {seller_bid}/unit, Buyer offers Rs {buyer_bid}/unit (no overlap)", "negotiation_failed", "market")
+        return None
+    
+    # Negotiate: meet in the middle
+    agreed_price = round((seller_bid + buyer_bid) / 2.0, 1)
+    
+    # Validate both parties profit
+    buyer_total_with_rent = agreed_price + TRANSMISSION_RENT_PER_UNIT
+    seller_profit_per_unit = agreed_price - WAPDA_GENERATION_COST
+    buyer_savings_per_unit = wapda_ref - buyer_total_with_rent
+    
+    # Total profit/savings
+    seller_total_profit = seller_profit_per_unit * trade_amount
+    buyer_total_savings = buyer_savings_per_unit * trade_amount
+    
+    # Validate profitability (allow zero or small negative for buyer to enable trades)
+    if seller_profit_per_unit < -0.5:
+        _log_to_firebase(f"❌ NO DEAL: Seller would lose Rs {abs(seller_profit_per_unit):.1f}/unit at price Rs {agreed_price}", "negotiation_failed", "market")
+        return None
+    
+    if buyer_savings_per_unit < -2.0:  # Allow small loss for buyer if grid price is close
+        _log_to_firebase(f"❌ NO DEAL: Buyer would lose Rs {abs(buyer_savings_per_unit):.1f}/unit at price Rs {buyer_total_with_rent} (WAPDA: Rs {wapda_ref})", "negotiation_failed", "market")
+        return None
+    
+    # Successful negotiation!
+    deal = {
+        "agreed_price": agreed_price,
+        "seller_bid": seller_bid,
+        "buyer_bid": buyer_bid,
+        "trade_amount": trade_amount,
+        "buyer_total_with_rent": buyer_total_with_rent,
+        "wapda_ref": wapda_ref,
+        "seller_profit_per_unit": seller_profit_per_unit,
+        "seller_total_profit": seller_total_profit,
+        "buyer_savings_per_unit": buyer_savings_per_unit,
+        "buyer_total_savings": buyer_total_savings,
+    }
+    
+    return deal
+
+
 def _process_negotiation(state, act_a, act_b):
     grid_status = state["grid"].get("status", "ONLINE")
     grid_price = state["grid"].get("price_per_unit", 0)
@@ -373,81 +453,119 @@ def _process_negotiation(state, act_a, act_b):
     net_a = power_flow["net_a"]
     net_b = power_flow["net_b"]
 
-    # --- AUTOMATIC POWER FLOW (ESP32-like logic) ---
-    # If House A has excess and House B has deficit: direct P2P trade
-    if net_a > 0 and net_b < 0 and (act_a == "OFFER_P2P" or act_b == "BUY_P2P"):
-        trade_amount = min(net_a, -net_b, P2P_TRADE_KWH)
-        
-        # AI-driven pricing
-        agent_a = EnergyAgent("house_a", "PRODUCER")
-        agent_b = EnergyAgent("house_b", "CONSUMER")
-        seller_bid = agent_a.calculate_optimal_price(state)  # What seller wants
-        buyer_bid = agent_b.calculate_optimal_price(state)   # What buyer is willing to pay
-        
-        # Negotiate: find middle ground or reject if no overlap
-        if buyer_bid >= seller_bid:
-            agreed_price = round((seller_bid + buyer_bid) / 2.0, 1)
-        else:
-            # No deal if buyer can't meet seller's minimum
-            return
-        
-        # Calculate financials (with transmission rent)
-        buyer_total_with_rent = agreed_price + TRANSMISSION_RENT_PER_UNIT
-        seller_gross = agreed_price * trade_amount
-        buyer_gross = buyer_total_with_rent * trade_amount
-        wapda_ref = WAPDA_PEAK_PRICE if grid_price >= 46.0 else WAPDA_OFFPEAK_PRICE
-        buyer_savings = (wapda_ref - buyer_total_with_rent) * trade_amount
-        seller_profit = (agreed_price - WAPDA_GENERATION_COST) * trade_amount
-        
-        _log_to_firebase(f"💰 P2P DEAL: {trade_amount:.2f} kWh @ Rs {agreed_price}/unit | Seller profit: Rs {seller_profit:.1f} | Buyer saves: Rs {buyer_savings:.1f}", "transaction", "market")
-        
-        # Update wallets
-        house_a_wallet = state["house_a"].get("wallet_balance", 0) + seller_gross
-        house_b_wallet = state["house_b"].get("wallet_balance", 0) - buyer_gross
-        
-        updates = {
-            "/house_a/wallet_balance": house_a_wallet,
-            "/house_b/wallet_balance": house_b_wallet,
-            "/market/active_contract": True,
-            "/market/transaction_price": agreed_price,
-            "/market/seller_bid": seller_bid,
-            "/market/buyer_bid": buyer_bid,
-            "/market/latest_transaction": f"P2P: {trade_amount:.2f}kWh @ Rs {agreed_price}/unit (rent: {TRANSMISSION_RENT_PER_UNIT})",
-            "/market/transaction_details": {
-                "seller": "house_a",
-                "buyer": "house_b",
-                "kwh": trade_amount,
-                "seller_price": agreed_price,
-                "buyer_total_cost": buyer_total_with_rent,
-                "transmission_rent": TRANSMISSION_RENT_PER_UNIT,
-                "seller_profit": round(seller_profit, 1),
-                "buyer_savings": round(buyer_savings, 1),
-                "wapda_reference": wapda_ref,
-            },
-            "/visuals/led_mode": "A_TO_B",
-        }
-        db.reference("/").update(updates)
-        
-        # Log detailed transaction
-        db.reference("/logs").push({
-            "timestamp": time.strftime("%H:%M:%S"),
-            "agent": "market",
-            "action": "TRANSACTION_EXECUTED",
-            "message": f"P2P {trade_amount:.2f}kWh @ Rs {agreed_price}/unit",
-            "details": f"Buyer pays Rs {buyer_total_with_rent}/unit (+ rent) | Seller profit: Rs {seller_profit:.1f} | Buyer saves: Rs {buyer_savings:.1f}"
-        })
-        
-        time.sleep(1)
-        db.reference("/market").update({"active_contract": False})
-        db.reference("/visuals").update({"led_mode": "IDLE"})
-        return
+    action_code = 0
+    action_label = "IDLE"
+    action_reason = "No profitable or required transfer."
 
+    # --- AUTOMATIC POWER FLOW (ESP32-like logic) ---
+    # P2P TRADE: If both agents want to trade AND it's profitable
+    # Allow trade if: A wants to sell OR A has higher battery, AND B wants to buy
+    p2p_possible = (act_a == "OFFER_P2P" or act_a == "SELL_TO_GRID") and act_b == "BUY_P2P"
+    p2p_possible = p2p_possible and (battery_a > 30)  # A must have some battery reserve
+    
+    if p2p_possible and net_b < 0:
+        # House A can sell from battery even if solar deficit
+        # Trade amount: what B needs OR what A can spare from battery
+        available_from_battery_a = (battery_a - 20) / 100.0 * BATTERY_CAPACITY_KWH  # Keep 20% reserve
+        available_from_battery_a = max(0, available_from_battery_a)
+        
+        trade_amount = min(-net_b, available_from_battery_a, P2P_TRADE_KWH)
+        
+        if trade_amount < 0.1:
+            _write_action_to_firebase(action_code, action_label, "Insufficient battery for P2P.")
+            # Fall through to grid purchase
+        else:
+            # Negotiate a deal
+            agent_a = EnergyAgent("house_a", "PRODUCER")
+            agent_b = EnergyAgent("house_b", "CONSUMER")
+            deal = _negotiate_p2p_deal(state, agent_a, agent_b, trade_amount)
+            
+            if deal is None:
+                _write_action_to_firebase(action_code, action_label, "Negotiation failed.")
+                # Fall through to grid purchase
+            else:
+                # Extract deal terms
+                agreed_price = deal["agreed_price"]
+                seller_bid = deal["seller_bid"]
+                buyer_bid = deal["buyer_bid"]
+                buyer_total_with_rent = deal["buyer_total_with_rent"]
+                seller_total_profit = deal["seller_total_profit"]
+                buyer_total_savings = deal["buyer_total_savings"]
+                wapda_ref = deal["wapda_ref"]
+                
+                # Log detailed negotiation
+                _log_to_firebase(
+                    f"💰 P2P NEGOTIATION:\n"
+                    f"  Seller bid: Rs {seller_bid}/unit | Buyer bid: Rs {buyer_bid}/unit\n"
+                    f"  ✅ DEAL @ Rs {agreed_price}/unit\n"
+                    f"  Seller profit: Rs {seller_total_profit:.1f} (Rs {deal['seller_profit_per_unit']:.1f}/unit)\n"
+                    f"  Buyer saves: Rs {buyer_total_savings:.1f} vs WAPDA (Rs {deal['buyer_savings_per_unit']:.1f}/unit)\n"
+                    f"  Buyer pays: Rs {buyer_total_with_rent}/unit | WAPDA: Rs {wapda_ref}/unit",
+                    "transaction",
+                    "market"
+                )
+                
+                # Update wallets
+                seller_gross = agreed_price * trade_amount
+                buyer_gross = buyer_total_with_rent * trade_amount
+                house_a_wallet = state["house_a"].get("wallet_balance", 0) + seller_gross
+                house_b_wallet = state["house_b"].get("wallet_balance", 0) - buyer_gross
+                
+                # Update batteries (A loses, B gains)
+                battery_delta = (trade_amount / BATTERY_CAPACITY_KWH) * 100
+                new_battery_a = max(0, battery_a - battery_delta)
+                new_battery_b = min(100, battery_b + battery_delta)
+                
+                updates = {
+                    "/house_a/wallet_balance": house_a_wallet,
+                    "/house_b/wallet_balance": house_b_wallet,
+                    "/house_a/battery_level": new_battery_a,
+                    "/house_b/battery_level": new_battery_b,
+                    "/market/active_contract": True,
+                    "/market/transaction_price": agreed_price,
+                    "/market/seller_bid": seller_bid,
+                    "/market/buyer_bid": buyer_bid,
+                    "/market/latest_transaction": f"P2P: {trade_amount:.2f}kWh @ Rs {agreed_price}/unit | Seller profit: Rs {seller_total_profit:.1f} | Buyer saves: Rs {buyer_total_savings:.1f}",
+                    "/market/transaction_details": {
+                        "seller": "house_a",
+                        "buyer": "house_b",
+                        "kwh": trade_amount,
+                        "seller_price": agreed_price,
+                        "buyer_total_cost": buyer_total_with_rent,
+                        "transmission_rent": TRANSMISSION_RENT_PER_UNIT,
+                        "seller_profit": round(seller_total_profit, 1),
+                        "buyer_savings": round(buyer_total_savings, 1),
+                        "wapda_reference": wapda_ref,
+                    },
+                    "/visuals/led_mode": "A_TO_B",
+                }
+                db.reference("/").update(updates)
+                
+                # Update local state
+                state["house_a"]["battery_level"] = new_battery_a
+                state["house_b"]["battery_level"] = new_battery_b
+                state["house_a"]["wallet_balance"] = house_a_wallet
+                state["house_b"]["wallet_balance"] = house_b_wallet
+
+                action_code = 1
+                action_label = "A_TO_B"
+                action_reason = "P2P trade agreed and executed."
+                _write_action_to_firebase(action_code, action_label, action_reason)
+        
+                time.sleep(1)
+                db.reference("/market").update({"active_contract": False})
+                db.reference("/visuals").update({"led_mode": "IDLE"})
+                return
     # --- MASJID DONATION (if excess energy and grid off) ---
     if act_a == "DONATE_MASJID" and grid_status == "BLACKOUT" and net_a > 0.5:
         _log_to_firebase(f"🕌 SubhanAllah! Energy {net_a:.2f} kWh donated to Masjid.", "charity", "house_a")
         current_donated = state.get("community", {}).get("total_donated_kwh", 0)
         db.reference("/community").update({"total_donated_kwh": current_donated + net_a})
         db.reference("/visuals").update({"led_mode": "MASJID_FLOW"})
+        action_code = 2
+        action_label = "A_TO_MASJID"
+        action_reason = "Charity flow enabled during blackout and excess available."
+        _write_action_to_firebase(action_code, action_label, action_reason)
         return
 
     # --- GRID INTERACTION (if no P2P match) ---
@@ -459,6 +577,9 @@ def _process_negotiation(state, act_a, act_b):
                 state["house_a"].get("wallet_balance", 0) - cost
             )
             db.reference("/visuals").update({"led_mode": "GRID_TO_A"})
+            action_code = 3
+            action_label = "GRID_TO_A"
+            action_reason = "House A deficit covered by grid."
         elif net_a > 0 and act_a == "SELL_TO_GRID":  # House A has excess
             revenue = grid_price * net_a
             _log_to_firebase(f"🔋 House A selling to grid: {net_a:.2f} kW @ Rs {grid_price}/unit = Rs {revenue:.1f}", "grid_sell", "house_a")
@@ -473,8 +594,14 @@ def _process_negotiation(state, act_a, act_b):
                 state["house_b"].get("wallet_balance", 0) - cost
             )
             db.reference("/visuals").update({"led_mode": "GRID_TO_B"})
+            if action_code == 0:
+                action_code = 4
+                action_label = "GRID_TO_B"
+                action_reason = "House B deficit covered by grid."
     else:
         db.reference("/visuals").update({"led_mode": "BLACKOUT"})
+
+    _write_action_to_firebase(action_code, action_label, action_reason)
 
 
 def run_marketplace_loop():
@@ -527,6 +654,16 @@ def run_simulation_from_csv(path=SIM_DATA_PATH):
 
             updates = _update_world_from_row(row, state)
             updates.update(_apply_battery_dynamics(state))
+            updates["/simulation/current_row"] = {
+                "timestamp": row.get("timestamp", ""),
+                "grid_status": row.get("grid_status", ""),
+                "grid_price": row.get("grid_price", ""),
+                "house_a_solar": row.get("house_a_solar", ""),
+                "house_a_load": row.get("house_a_load", ""),
+                "house_b_solar": row.get("house_b_solar", ""),
+                "house_b_load": row.get("house_b_load", ""),
+                "index": idx,
+            }
             db.reference("/").update(updates)
 
             # Get agent decisions
