@@ -31,19 +31,75 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 LIST_MODELS = os.getenv("GEMINI_LIST_MODELS")
 USE_MOCK = os.getenv("USE_MOCK_AGENTS", "false").lower() == "true"
-_loop_delay_raw = os.getenv("LOOP_DELAY", "15").strip()
-LOOP_DELAY = int(_loop_delay_raw) if _loop_delay_raw else 15  # Seconds between iterations
+_loop_delay_raw = os.getenv("LOOP_DELAY", "3").strip()
+LOOP_DELAY = int(_loop_delay_raw) if _loop_delay_raw else 3  # Seconds between iterations (3s per 30-min step)
 SIM_DATA_PATH = os.getenv("SIMULATION_DATA_PATH", "simulation_data.csv")
-STEP_MINUTES = float(os.getenv("SIMULATION_STEP_MINUTES", "0.25"))
+STEP_MINUTES = float(os.getenv("SIMULATION_STEP_MINUTES", "30"))  # 30-minute simulation steps
 
 BATTERY_CAPACITY_KWH = float(os.getenv("BATTERY_CAPACITY_KWH", "10"))
 P2P_TRADE_KWH = float(os.getenv("P2P_TRADE_KWH", "0.5"))
 GRID_CHARGE_KWH = float(os.getenv("GRID_CHARGE_KWH", "0.5"))
 
+# --- WAPDA PRICING & TRANSMISSION ---
+WAPDA_GENERATION_COST = 11.0  # WAPDA buys 1 unit for 11 rupees
+WAPDA_PEAK_PRICE = 48.0       # WAPDA sells 1 unit at 48 rupees during peak
+WAPDA_OFFPEAK_PRICE = 38.0    # WAPDA sells 1 unit at 38 rupees off-peak
+TRANSMISSION_RENT_PER_UNIT = 18.0  # Wire rental charged to buyer
+
+
+def _log_to_firebase(message: str, log_type: str = "info", agent: str = "system") -> None:
+    """Push console messages to Firebase in real-time."""
+    try:
+        timestamp = time.strftime("%H:%M:%S")
+        db.reference("/logs").push({
+            "timestamp": timestamp,
+            "agent": agent,
+            "type": log_type,
+            "message": message,
+        })
+        print(message)  # Also print to terminal
+    except Exception as e:
+        print(f"[LOG ERROR] {e}")
+        print(message)  # Fallback: just print if Firebase fails
+
+
 class EnergyAgent:
     def __init__(self, name, role):
         self.name = name
         self.role = role
+
+    def calculate_optimal_price(self, world_state):
+        """AI-driven price calculation for P2P selling."""
+        grid = world_state['grid']
+        grid_price = grid.get("price_per_unit", WAPDA_OFFPEAK_PRICE)
+        grid_status = grid.get("status", "ONLINE")
+        is_peak = grid_price >= 46.0
+        
+        # WAPDA reference price (what grid charges buyer)
+        wapda_ref = WAPDA_PEAK_PRICE if is_peak else WAPDA_OFFPEAK_PRICE
+        
+        if self.role == "PRODUCER":
+            # Seller wants to maximize profit while staying cheaper than WAPDA
+            # Profit margin = seller_price - WAPDA_GENERATION_COST
+            # Buyer total cost = seller_price + TRANSMISSION_RENT_PER_UNIT
+            
+            # Upper bound: Buyer should pay less than WAPDA
+            buyer_ceiling = wapda_ref - 5.0  # Give buyer at least 5 rupee discount
+            
+            # Seller wants to make > 11 rupees (generation cost)
+            # Ideally: sell_price >= WAPDA_GENERATION_COST + margin
+            margin_target = 5.0  # Seller wants 5 rupee profit
+            sell_price = max(WAPDA_GENERATION_COST + margin_target, buyer_ceiling - TRANSMISSION_RENT_PER_UNIT)
+            
+            return round(min(sell_price, buyer_ceiling - TRANSMISSION_RENT_PER_UNIT), 1)
+        
+        else:
+            # Buyer wants to minimize cost
+            # If grid is OFF, willing to pay more
+            if grid_status == "BLACKOUT":
+                return round(WAPDA_PEAK_PRICE * 0.9, 1)  # 90% of peak price
+            else:
+                return round(min(WAPDA_OFFPEAK_PRICE * 0.8, 30.0), 1)  # Max 30 rupees
 
     def generate_prompt(self, world_state):
         grid = world_state['grid']
@@ -118,15 +174,15 @@ class EnergyAgent:
 
             # Update Log
             if action == "OFFER_P2P":
-                print(f"🟢 {self.name}: SELLING  | {reasoning[:50]}...")
+                _log_to_firebase(f"🟢 {self.name}: SELLING  | {reasoning[:50]}...", "decision", self.name)
             elif action == "CHARGE_FROM_GRID":
-                print(f"🔌 {self.name}: CHARGING | {reasoning[:50]}...")
+                _log_to_firebase(f"🔌 {self.name}: CHARGING | {reasoning[:50]}...", "decision", self.name)
             elif action == "DONATE_MASJID":
-                print(f"🕌 {self.name}: CHARITY  | {reasoning[:50]}...")
+                _log_to_firebase(f"🕌 {self.name}: CHARITY  | {reasoning[:50]}...", "decision", self.name)
             elif action == "CHARGE_BATTERY":
-                print(f"🔋 {self.name}: STORING  | {reasoning[:50]}...")
+                _log_to_firebase(f"🔋 {self.name}: STORING  | {reasoning[:50]}...", "decision", self.name)
             else:
-                print(f"⚪ {self.name}: {action}     | {reasoning[:50]}...")
+                _log_to_firebase(f"⚪ {self.name}: {action}     | {reasoning[:50]}...", "decision", self.name)
             db.reference(f'/{self.name}').update({
                 "agent_log": reasoning,
                 "last_action": action
@@ -141,14 +197,14 @@ class EnergyAgent:
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
-                print(f"⚠️ Quota exhausted. Using fallback mock response.")
+                _log_to_firebase(f"⚠️ Quota exhausted. Using fallback mock response.", "warning", self.name)
                 # Return mock response on quota error
                 if self.role == "PRODUCER":
                     return "OFFER_P2P"
                 else:
                     return "BUY_P2P"
             else:
-                print(f"❌ Error: {e}")
+                _log_to_firebase(f"❌ Error: {e}", "error", self.name)
                 return "HOLD"
 
 def _clamp(value, min_value, max_value):
@@ -319,34 +375,76 @@ def _process_negotiation(state, act_a, act_b):
 
     # --- AUTOMATIC POWER FLOW (ESP32-like logic) ---
     # If House A has excess and House B has deficit: direct P2P trade
-    if net_a > 0 and net_b < 0:
-        trade_amount = min(net_a, -net_b)
-        price = _negotiate_p2p_price(grid_price, grid_status, battery_a, battery_b)
+    if net_a > 0 and net_b < 0 and (act_a == "OFFER_P2P" or act_b == "BUY_P2P"):
+        trade_amount = min(net_a, -net_b, P2P_TRADE_KWH)
         
-        if price is not None:
-            print(f"⚡ AUTO P2P TRADE: {trade_amount:.2f} kW @ Rs {price}/kWh")
-            
-            # Update wallets
-            total_cost = price * trade_amount
-            house_a_wallet = state["house_a"].get("wallet_balance", 0) + total_cost
-            house_b_wallet = state["house_b"].get("wallet_balance", 0) - total_cost
-            
-            updates = {
-                "/house_a/wallet_balance": house_a_wallet,
-                "/house_b/wallet_balance": house_b_wallet,
-                "/market/active_contract": True,
-                "/market/transaction_price": price,
-                "/market/latest_transaction": f"P2P DEAL: {trade_amount:.2f} kWh @ Rs {price}/kWh",
-                "/visuals/led_mode": "A_TO_B",
-            }
-            db.reference("/").update(updates)
-            db.reference("/market").update({"active_contract": False})
-            db.reference("/visuals").update({"led_mode": "IDLE"})
+        # AI-driven pricing
+        agent_a = EnergyAgent("house_a", "PRODUCER")
+        agent_b = EnergyAgent("house_b", "CONSUMER")
+        seller_bid = agent_a.calculate_optimal_price(state)  # What seller wants
+        buyer_bid = agent_b.calculate_optimal_price(state)   # What buyer is willing to pay
+        
+        # Negotiate: find middle ground or reject if no overlap
+        if buyer_bid >= seller_bid:
+            agreed_price = round((seller_bid + buyer_bid) / 2.0, 1)
+        else:
+            # No deal if buyer can't meet seller's minimum
             return
+        
+        # Calculate financials (with transmission rent)
+        buyer_total_with_rent = agreed_price + TRANSMISSION_RENT_PER_UNIT
+        seller_gross = agreed_price * trade_amount
+        buyer_gross = buyer_total_with_rent * trade_amount
+        wapda_ref = WAPDA_PEAK_PRICE if grid_price >= 46.0 else WAPDA_OFFPEAK_PRICE
+        buyer_savings = (wapda_ref - buyer_total_with_rent) * trade_amount
+        seller_profit = (agreed_price - WAPDA_GENERATION_COST) * trade_amount
+        
+        _log_to_firebase(f"💰 P2P DEAL: {trade_amount:.2f} kWh @ Rs {agreed_price}/unit | Seller profit: Rs {seller_profit:.1f} | Buyer saves: Rs {buyer_savings:.1f}", "transaction", "market")
+        
+        # Update wallets
+        house_a_wallet = state["house_a"].get("wallet_balance", 0) + seller_gross
+        house_b_wallet = state["house_b"].get("wallet_balance", 0) - buyer_gross
+        
+        updates = {
+            "/house_a/wallet_balance": house_a_wallet,
+            "/house_b/wallet_balance": house_b_wallet,
+            "/market/active_contract": True,
+            "/market/transaction_price": agreed_price,
+            "/market/seller_bid": seller_bid,
+            "/market/buyer_bid": buyer_bid,
+            "/market/latest_transaction": f"P2P: {trade_amount:.2f}kWh @ Rs {agreed_price}/unit (rent: {TRANSMISSION_RENT_PER_UNIT})",
+            "/market/transaction_details": {
+                "seller": "house_a",
+                "buyer": "house_b",
+                "kwh": trade_amount,
+                "seller_price": agreed_price,
+                "buyer_total_cost": buyer_total_with_rent,
+                "transmission_rent": TRANSMISSION_RENT_PER_UNIT,
+                "seller_profit": round(seller_profit, 1),
+                "buyer_savings": round(buyer_savings, 1),
+                "wapda_reference": wapda_ref,
+            },
+            "/visuals/led_mode": "A_TO_B",
+        }
+        db.reference("/").update(updates)
+        
+        # Log detailed transaction
+        db.reference("/logs").push({
+            "timestamp": time.strftime("%H:%M:%S"),
+            "agent": "market",
+            "action": "TRANSACTION_EXECUTED",
+            "message": f"P2P {trade_amount:.2f}kWh @ Rs {agreed_price}/unit",
+            "details": f"Buyer pays Rs {buyer_total_with_rent}/unit (+ rent) | Seller profit: Rs {seller_profit:.1f} | Buyer saves: Rs {buyer_savings:.1f}"
+        })
+        
+        time.sleep(1)
+        db.reference("/market").update({"active_contract": False})
+        db.reference("/visuals").update({"led_mode": "IDLE"})
+        return
 
     # --- MASJID DONATION (if excess energy and grid off) ---
     if act_a == "DONATE_MASJID" and grid_status == "BLACKOUT" and net_a > 0.5:
-        print("🕌 SubhanAllah! Energy donated to Masjid.")
+        _log_to_firebase(f"🕌 SubhanAllah! Energy {net_a:.2f} kWh donated to Masjid.", "charity", "house_a")
         current_donated = state.get("community", {}).get("total_donated_kwh", 0)
         db.reference("/community").update({"total_donated_kwh": current_donated + net_a})
         db.reference("/visuals").update({"led_mode": "MASJID_FLOW"})
@@ -355,22 +453,22 @@ def _process_negotiation(state, act_a, act_b):
     # --- GRID INTERACTION (if no P2P match) ---
     if grid_status == "ONLINE":
         if net_a < 0:  # House A needs power
-            print(f"🔌 House A charging from grid: {-net_a:.2f} kW")
             cost = grid_price * (-net_a)
+            _log_to_firebase(f"🔌 House A charging from grid: {-net_a:.2f} kW @ Rs {grid_price}/unit = Rs {cost:.1f}", "grid_buy", "house_a")
             db.reference("/house_a/wallet_balance").set(
                 state["house_a"].get("wallet_balance", 0) - cost
             )
             db.reference("/visuals").update({"led_mode": "GRID_TO_A"})
-        elif net_a > 0:  # House A has excess
-            print(f"🔋 House A selling to grid: {net_a:.2f} kW @ Rs {grid_price}")
+        elif net_a > 0 and act_a == "SELL_TO_GRID":  # House A has excess
             revenue = grid_price * net_a
+            _log_to_firebase(f"🔋 House A selling to grid: {net_a:.2f} kW @ Rs {grid_price}/unit = Rs {revenue:.1f}", "grid_sell", "house_a")
             db.reference("/house_a/wallet_balance").set(
                 state["house_a"].get("wallet_balance", 0) + revenue
             )
         
         if net_b < 0:  # House B needs power
-            print(f"🔌 House B charging from grid: {-net_b:.2f} kW")
             cost = grid_price * (-net_b)
+            _log_to_firebase(f"🔌 House B charging from grid: {-net_b:.2f} kW @ Rs {grid_price}/unit = Rs {cost:.1f}", "grid_buy", "house_b")
             db.reference("/house_b/wallet_balance").set(
                 state["house_b"].get("wallet_balance", 0) - cost
             )
@@ -380,13 +478,13 @@ def _process_negotiation(state, act_a, act_b):
 
 
 def run_marketplace_loop():
-    print("🚀 ECHO-GRID: Agentic Layer Initialized...")
-    print(f"📊 Loop delay: {LOOP_DELAY}s | Mock mode: {USE_MOCK}")
+    _log_to_firebase("🚀 ECHO-GRID: Agentic Layer Initialized...", "startup", "system")
+    _log_to_firebase(f"📊 Loop delay: {LOOP_DELAY}s | Mock mode: {USE_MOCK}", "startup", "system")
     while True:
         try:
             state = get_full_state()
             if not state or "grid" not in state or "simulation" not in state:
-                print("⚠️ Missing world state. Resetting simulation...")
+                _log_to_firebase("⚠️ Missing world state. Resetting simulation...", "warning", "system")
                 reset_simulation()
                 time.sleep(1)
                 continue
@@ -404,15 +502,16 @@ def run_marketplace_loop():
             time.sleep(LOOP_DELAY)
 
         except KeyboardInterrupt:
+            _log_to_firebase("🛑 Simulation stopped by user.", "info", "system")
             break
         except Exception as e:
-            print(f"⚠️ Loop Error: {e}")
+            _log_to_firebase(f"⚠️ Loop Error: {e}", "error", "system")
             time.sleep(LOOP_DELAY)
 
 
 def run_simulation_from_csv(path=SIM_DATA_PATH):
-    print("🚀 ECHO-GRID: Dataset Simulation Initialized...")
-    print(f"📁 Dataset: {path} | Step: {STEP_MINUTES} min | Mock mode: {USE_MOCK}")
+    _log_to_firebase("🚀 ECHO-GRID: Dataset Simulation Initialized...", "startup", "system")
+    _log_to_firebase(f"📁 Dataset: {path} | Step: {STEP_MINUTES} min | Mock mode: {USE_MOCK}", "startup", "system")
     rows = _load_simulation_rows(path)
     if not rows:
         raise RuntimeError("Simulation dataset is empty.")

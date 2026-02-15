@@ -2,15 +2,9 @@ import pandas as pd
 import numpy as np
 import os
 
-# Get simulation mode from env (full or test)
-SIM_MODE = os.getenv("SIMULATION_MODE", "test").lower()
-
-if SIM_MODE == "full":
-    # Time range: 24 hours in 5-minute intervals
-    times = pd.date_range("2026-02-14 00:00:00", "2026-02-14 23:55:00", freq="5min")
-else:
-    # Time range: 2 hours in 5-minute intervals (24 steps for quick testing)
-    times = pd.date_range("2026-02-14 00:00:00", "2026-02-14 02:00:00", freq="5min")
+# Generate full 24-hour dataset with 30-minute increments
+# 48 steps total (24 hours / 0.5 hours = 48) running in ~144 seconds at 3s per step
+times = pd.date_range("2026-02-14 00:00:00", "2026-02-14 23:30:00", freq="30min")
 
 data = []
 
@@ -53,6 +47,6 @@ for t in times:
 
 df = pd.DataFrame(data)
 df.to_csv("simulation_data.csv", index=False)
-print(f"✅ Dataset generated: simulation_data.csv ({SIM_MODE} mode, {len(df)} steps)")
-print(f"⏱️  Duration: {len(df) * 0.25 / 60:.1f} minutes")
+print(f"✅ Dataset generated: simulation_data.csv ({len(df)} steps - Full 24h day)")
+print(f"⏱️  Duration: {len(df) * 30 / 60:.1f} hours | Test runtime: ~{len(df) * 3} seconds at 3s per step")
 print(df.head(10))

@@ -40,7 +40,7 @@ st.markdown("""
 dashboard = st.empty()
 
 
-def _fetch_logs(limit: int = 50) -> list[str]:
+def _fetch_logs(limit: int = 100) -> list[str]:
     try:
         logs = db.reference("/logs").order_by_key().limit_to_last(limit).get() or {}
     except Exception:
@@ -49,13 +49,23 @@ def _fetch_logs(limit: int = 50) -> list[str]:
     entries = []
     for _, item in logs.items():
         timestamp = item.get("timestamp", "--:--:--")
-        agent = item.get("agent", "agent")
-        action = item.get("action", "HOLD")
+        agent = item.get("agent", "system")
+        log_type = item.get("type", "info")
         message = item.get("message", "")
-        details = item.get("details", "")
-        line = f"[{timestamp}] {agent} | {action} | {message}"
-        if details:
-            line = f"{line} | {details}"
+        
+        # Color-code by type
+        icon_map = {
+            "decision": "🤖",
+            "transaction": "💰",
+            "charity": "🕌",
+            "grid_buy": "🔌",
+            "grid_sell": "🔋",
+            "error": "❌",
+            "warning": "⚠️",
+            "startup": "🚀",
+        }
+        icon = icon_map.get(log_type, "📋")
+        line = f"[{timestamp}] {icon} {agent.upper()}: {message}"
         entries.append(line)
     return entries
 
@@ -195,25 +205,14 @@ def _auto_refresh(interval_ms: int) -> None:
 
 # --- LOGS FRAGMENT (auto-refresh only this section when supported) ---
 def _render_logs_section() -> None:
-    st.subheader("📡 Agent Communication Log")
-    with st.container(height=250):
-        entries = _fetch_logs(limit=100)
-        try:
-            market = db.reference("/market").get() or {}
-        except Exception:
-            market = {}
-        latest_transaction = market.get("latest_transaction")
-        transaction_price = market.get("transaction_price")
-        last_seen_market = st.session_state.get("_last_market_log")
-        if latest_transaction and latest_transaction != last_seen_market:
-            stamp = time.strftime("%H:%M:%S")
-            price_text = f" | price: {transaction_price}" if transaction_price is not None else ""
-            entries.append(f"[{stamp}] market | TRANSACTION | {latest_transaction}{price_text}")
-            st.session_state._last_market_log = latest_transaction
+    st.subheader("📡 Real-Time Agent Log Stream")
+    with st.container(height=500):
+        entries = _fetch_logs(limit=200)
+        
         if not entries:
             entries = _fallback_logs()
         if not entries:
-            st.markdown("No activity yet.")
+            st.markdown("_No activity yet. Waiting for agents..._")
         else:
             for entry in entries:
                 st.markdown(entry)
