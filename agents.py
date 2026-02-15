@@ -131,6 +131,12 @@ class EnergyAgent:
                 "agent_log": reasoning,
                 "last_action": action
             })
+            db.reference("/logs").push({
+                "timestamp": time.strftime("%H:%M:%S"),
+                "agent": self.name,
+                "action": action,
+                "message": reasoning,
+            })
             return action
         except Exception as e:
             error_msg = str(e)

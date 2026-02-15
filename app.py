@@ -40,12 +40,44 @@ st.markdown("""
 dashboard = st.empty()
 
 
-def _append_log(entry: str, max_items: int = 50) -> None:
-    if "agent_log_history" not in st.session_state:
-        st.session_state.agent_log_history = []
-    st.session_state.agent_log_history.append(entry)
-    if len(st.session_state.agent_log_history) > max_items:
-        st.session_state.agent_log_history = st.session_state.agent_log_history[-max_items:]
+def _fetch_logs(limit: int = 50) -> list[str]:
+    try:
+        logs = db.reference("/logs").order_by_key().limit_to_last(limit).get() or {}
+    except Exception:
+        return []
+
+    entries = []
+    for _, item in logs.items():
+        timestamp = item.get("timestamp", "--:--:--")
+        agent = item.get("agent", "agent")
+        action = item.get("action", "HOLD")
+        message = item.get("message", "")
+        details = item.get("details", "")
+        line = f"[{timestamp}] {agent} | {action} | {message}"
+        if details:
+            line = f"{line} | {details}"
+        entries.append(line)
+    return entries
+
+
+def _fallback_logs() -> list[str]:
+    try:
+        data = get_full_state() or {}
+    except Exception:
+        return []
+
+    house_a = data.get("house_a", {})
+    house_b = data.get("house_b", {})
+    market = data.get("market", {})
+    entries = []
+    timestamp = time.strftime("%H:%M:%S")
+    if house_a.get("agent_log"):
+        entries.append(f"[{timestamp}] house_a: {house_a.get('agent_log')}")
+    if house_b.get("agent_log"):
+        entries.append(f"[{timestamp}] house_b: {house_b.get('agent_log')}")
+    if market.get("latest_transaction"):
+        entries.append(f"[{timestamp}] market: {market.get('latest_transaction')}")
+    return entries
 
 def render_dashboard():
     # 1. FETCH REAL-TIME DATA
@@ -85,19 +117,6 @@ def render_dashboard():
     # Track live log changes for display
     house_a_log = house_a.get("agent_log", "Sleeping...")
     house_b_log = house_b.get("agent_log", "Sleeping...")
-    last_trade = market.get("latest_transaction")
-    last_seen = st.session_state.get("_last_logs", {})
-    if house_a_log and house_a_log != last_seen.get("house_a"):
-        _append_log(f"[{time.strftime('%H:%M:%S')}] House A: {house_a_log}")
-    if house_b_log and house_b_log != last_seen.get("house_b"):
-        _append_log(f"[{time.strftime('%H:%M:%S')}] House B: {house_b_log}")
-    if last_trade and last_trade != last_seen.get("trade"):
-        _append_log(f"[{time.strftime('%H:%M:%S')}] Market: {last_trade}")
-    st.session_state._last_logs = {
-        "house_a": house_a_log,
-        "house_b": house_b_log,
-        "trade": last_trade,
-    }
 
     with dashboard.container():
         # --- ROW 1: MARKET STATUS ---
@@ -178,14 +197,26 @@ def _auto_refresh(interval_ms: int) -> None:
 def _render_logs_section() -> None:
     st.subheader("📡 Agent Communication Log")
     with st.container(height=250):
-        for entry in st.session_state.get("agent_log_history", ["No activity yet."]):
-            st.markdown(entry)
-
-
-def _render_logs_live(enable_live: bool) -> None:
-    if enable_live:
-        _auto_refresh(interval_ms=2000)
-    _render_logs_section()
+        entries = _fetch_logs(limit=100)
+        try:
+            market = db.reference("/market").get() or {}
+        except Exception:
+            market = {}
+        latest_transaction = market.get("latest_transaction")
+        transaction_price = market.get("transaction_price")
+        last_seen_market = st.session_state.get("_last_market_log")
+        if latest_transaction and latest_transaction != last_seen_market:
+            stamp = time.strftime("%H:%M:%S")
+            price_text = f" | price: {transaction_price}" if transaction_price is not None else ""
+            entries.append(f"[{stamp}] market | TRANSACTION | {latest_transaction}{price_text}")
+            st.session_state._last_market_log = latest_transaction
+        if not entries:
+            entries = _fallback_logs()
+        if not entries:
+            st.markdown("No activity yet.")
+        else:
+            for entry in entries:
+                st.markdown(entry)
 
 
 # --- RENDER DASHBOARD ---
@@ -194,10 +225,17 @@ render_dashboard()
 
 # Try to refresh only the logs section if fragments are available
 if hasattr(st, "fragment"):
-    @st.fragment
-    def _logs_fragment():
-        _render_logs_live(enable_live)
+    if enable_live:
+        @st.fragment(run_every=2)
+        def _logs_fragment():
+            _render_logs_section()
+    else:
+        @st.fragment
+        def _logs_fragment():
+            _render_logs_section()
 
     _logs_fragment()
 else:
-    _render_logs_live(enable_live)
+    if enable_live:
+        _auto_refresh(interval_ms=2000)
+    _render_logs_section()

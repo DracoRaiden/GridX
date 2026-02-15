@@ -21,10 +21,12 @@ for t in times:
     # Load Shedding from 7 PM to 9 PM (19:00 - 21:00)
     is_load_shedding = 1 if (19 <= hour < 21) else 0
     grid_voltage = 0 if is_load_shedding else 220
-    
-    # Peak Hours: 5 PM - 10 PM (Rs 65), Off-Peak (Rs 22)
-    grid_price = 65.0 if (17 <= hour <= 22) else 22.0
-    if is_load_shedding: grid_price = 0 # Irrelevant, but 0 indicates no grid
+
+    # Peak Hours: 6 PM - 10 PM (Rs 46), Off-Peak (Rs 38)
+    is_peak = True if (18 <= hour < 22) else False
+    grid_price = 46.0 if is_peak else 38.0
+    if is_load_shedding:
+        grid_price = 0  # Irrelevant, but 0 indicates no grid
 
     # --- 2. HOUSE A (The Producer - Rich Solar) ---
     # Solar Curve (Bell shape peak at 1pm)
@@ -42,6 +44,7 @@ for t in times:
         "timestamp": t.strftime("%H:%M:%S"),
         "grid_status": "OFF" if is_load_shedding else "ON",
         "grid_price": grid_price,
+        "peak_period": "PEAK" if is_peak else "OFF_PEAK",
         "house_a_solar": round(solar_a, 2),
         "house_a_load": round(load_a, 2),
         "house_b_solar": 0.0,
